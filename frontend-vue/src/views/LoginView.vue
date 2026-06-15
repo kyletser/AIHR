@@ -8,11 +8,11 @@
       </div>
       <div class="rounded-2xl border border-gray-200 bg-white shadow-sm p-8">
         <h2 class="text-lg font-bold text-gray-900 mb-6">登录</h2>
-        <div v-if="error" class="mb-4 p-3 bg-red-50 border border-red-100 rounded-xl text-red-500 text-xs">{{ error }}</div>
+        <div v-if="err" class="mb-4 p-3 bg-red-50 border border-red-100 rounded-xl text-red-500 text-xs">{{ err }}</div>
         <div class="space-y-4">
-          <input v-model="username" placeholder="用户名" class="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:border-[#d4a853]" @keyup.enter="handleLogin">
-          <input v-model="password" type="password" placeholder="密码" class="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:border-[#d4a853]" @keyup.enter="handleLogin">
-          <button @click="handleLogin" :disabled="loading" class="w-full py-3 bg-gray-900 text-white rounded-xl font-bold text-sm hover:bg-gray-800 transition-colors disabled:opacity-40">{{ loading?'登录中...':'登录' }}</button>
+          <input v-model="u" placeholder="用户名" class="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:border-[#d4a853]" @keyup.enter="handleLogin">
+          <input v-model="p" type="password" placeholder="密码" class="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:border-[#d4a853]" @keyup.enter="handleLogin">
+          <button @click="handleLogin" :disabled="l" class="w-full py-3 bg-gray-900 text-white rounded-xl font-bold text-sm hover:bg-gray-800 transition-colors disabled:opacity-40">{{ l?'登录中...':'登录' }}</button>
         </div>
         <p class="text-center text-gray-400 text-xs mt-6">没有账号？<router-link to="/register" class="text-[#d4a853] hover:underline">注册</router-link></p>
       </div>

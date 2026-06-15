@@ -15,6 +15,20 @@
       </div>
     </header>
 
+    <!-- Demo banner: shown when no analysis yet -->
+    <div v-if="!result && !resumeText" class="max-w-7xl mx-auto px-8 pt-8 relative z-10">
+      <div class="rounded-2xl bg-gradient-to-r from-[#d4a853]/10 to-amber-50 border border-[#d4a853]/20 p-6 flex flex-col sm:flex-row items-start sm:items-center gap-4">
+        <div class="flex-1">
+          <h2 class="text-sm font-bold text-gray-900 mb-1">👋 首次使用？试试示例</h2>
+          <p class="text-xs text-gray-500">一键加载预设简历和岗位描述，30 秒体验完整分析流程</p>
+        </div>
+        <button @click="runDemo" :disabled="analyzing"
+          class="px-6 py-2.5 bg-[#d4a853] text-white rounded-xl text-sm font-bold hover:bg-[#c49a3f] transition-all disabled:opacity-40 whitespace-nowrap shadow-sm">
+          {{ analyzing ? '分析中...' : '🚀 试试示例' }}
+        </button>
+      </div>
+    </div>
+
     <div class="max-w-7xl mx-auto px-8 py-12 space-y-10">
       <div class="flex gap-1">
         <div v-for="(s,i) in ['简历','JD','分析']" :key="i"
@@ -36,6 +50,17 @@
           <div v-if="savedResumes.length" class="flex flex-wrap gap-1.5 mb-3">
             <button v-for="r in savedResumes" :key="r.resume_id" @click="loadSaved(r.resume_id)"
               class="text-xs px-2 py-1 rounded border border-gray-200 text-gray-500 hover:text-[#d4a853] hover:border-[#d4a853]/30 transition-colors">{{ r.filename }}</button>
+          </div>
+          <div v-if="matchHistory.length" class="mb-3">
+            <div class="text-xs text-gray-400 uppercase tracking-widest mb-2">历史分析</div>
+            <div class="space-y-1">
+              <button v-for="h in matchHistory" :key="h.match_id" @click="showHistory(h.match_id)"
+                class="w-full text-left text-xs px-2 py-1.5 rounded border border-gray-100 hover:border-[#d4a853]/30 hover:bg-[#d4a853]/5 transition-all">
+                <span class="font-medium text-gray-700">{{ h.jd_title }}</span>
+                <span class="ml-2 font-mono font-bold" :class="h.overall_score>=70?'text-emerald-500':h.overall_score>=50?'text-[#d4a853]':'text-red-400'">{{ h.overall_score }}分</span>
+                <span class="text-gray-400 ml-1">{{ h.created_at?.slice(0,10) }}</span>
+              </button>
+            </div>
           </div>
           <div class="border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all"
             :class="file?'border-emerald-400/30 bg-emerald-50':'border-gray-200 hover:border-gray-400'"
@@ -207,7 +232,7 @@ import { useAuthStore } from '../stores/auth'
 import axios from 'axios'
 
 const router=useRouter(); const auth=useAuthStore()
-const industry=ref('internet'),file=ref(null),uploading=ref(false),upStatus=ref(''),resumeText=ref(''),jdText=ref(''),analyzing=ref(false),err=ref(''),result=shallowRef(null),cs=ref(''),savedResumes=ref([]),savedVersions=ref([]),versionMsg=ref('')
+const industry=ref('internet'),file=ref(null),uploading=ref(false),upStatus=ref(''),resumeText=ref(''),jdText=ref(''),analyzing=ref(false),err=ref(''),result=shallowRef(null),cs=ref(''),savedResumes=ref([]),matchHistory=ref([]),savedVersions=ref([]),versionMsg=ref('')
 let radarChart=null; const rc=ref(null)
 function logout(){auth.logout();router.push('/login')}
 
@@ -231,9 +256,43 @@ function actionClass(a){return a==='优先投递'?'bg-emerald-100 text-emerald-7
 async function doExtract(){if(!file.value)return;uploading.value=true;upStatus.value='<span class="text-gray-400">⏳ 提取...</span>';try{const f=new FormData();f.append('file',file.value);const{data}=await axios.post('/api/extract-text',f);resumeText.value=data.text;upStatus.value='<span class="text-emerald-500">✓ 已提取</span>'}catch(e){upStatus.value='<span class="text-red-500">✗ '+(e.response?.data?.detail||e.message)+'</span>'};uploading.value=false}
 async function doAnalyze(){if(!ready.value)return;analyzing.value=true;err.value='';try{const{data}=await axios.post('/api/analyze-v2',{resume_text:resumeText.value,jd_text:jdText.value,filename:file.value?.name||'简历'});sessionStorage.setItem(`match:${data.match_id}`,JSON.stringify(data));router.push(`/analysis/${data.match_id}`)}catch(e){err.value=e.response?.data?.detail||e.message};analyzing.value=false}
 async function renderRadar(){const c=rc.value;if(!c)return;const{Chart}=await import('chart.js/auto');const s=Math.min(c.parentElement.clientWidth,380);c.width=s;c.height=s;const ctx=c.getContext('2d');if(!ctx)return;if(radarChart)radarChart.destroy();const keys=Object.keys(dimLabels);radarChart=new Chart(ctx,{type:'radar',data:{labels:Object.values(dimLabels),datasets:[{data:keys.map(k=>dim(k)),backgroundColor:'rgba(212,168,83,0.08)',borderColor:'#d4a853',borderWidth:2,pointBackgroundColor:'#fff',pointBorderColor:'#d4a853',pointBorderWidth:2,pointRadius:4}]},options:{responsive:false,scales:{r:{beginAtZero:true,max:100,ticks:{stepSize:20,font:{size:9},color:'#9ca3af',backdropColor:'transparent'},pointLabels:{font:{size:10,weight:'600'},color:'#374151'},grid:{color:'#e5e7eb'},angleLines:{color:'#e5e7eb'}}},plugins:{legend:{display:false}}}})}
-async function loadSaved(id){try{const{data}=await axios.get(`/api/resume/${id}`);resumeText.value=data.resume_text||''}catch(e){}}
+async function loadSaved(id){try{const{data}=await axios.get(`/api/resume/${id}`);resumeText.value=data.resume_text||'';if(data.last_analysis){jdText.value=data.last_analysis.jd_text||'';result.value=data.last_analysis;await nextTick();renderRadar()}}catch(e){}}
 async function loadVersions(){try{const{data}=await axios.get('/api/resume-versions');savedVersions.value=data.versions||[]}catch(e){}}
+async function loadHistory(){try{const{data}=await axios.get('/api/match-history');matchHistory.value=data.history||[]}catch(e){}}
+async function showHistory(id){try{const{data}=await axios.get(`/api/match/${id}`);resumeText.value=data.resume_text||'';jdText.value=data.jd_text||'';result.value=data;await nextTick();renderRadar()}catch(e){}}
+async function runDemo(){
+  resumeText.value=`个人信息
+姓名：张三 | 学校：XX大学 计算机科学与技术 | 2025届本科 | GPA 3.6/4.0
+
+技能
+- 编程语言：Python, Java, C++, JavaScript
+- 后端：Spring Boot, Django, MySQL, Redis
+- 前端：Vue.js, HTML/CSS, Element UI
+- 工具：Git, Docker, Linux
+
+项目经历
+基于微服务的在线教育平台  | 后端负责人 | 2024.03-2024.06
+设计并实现了基于Spring Cloud的微服务架构，拆分为用户服务、课程服务、订单服务3个模块。使用Redis缓存热点课程数据，MySQL主从复制保证数据一致性。通过RabbitMQ实现订单异步处理，QPS从500提升至2000+
+
+校园二手交易小程序 | 独立开发 | 2023.09-2023.12
+使用Vue.js + Django REST framework开发，实现商品发布、搜索、即时通讯功能。集成微信支付和地图定位，上线3个月积累2000+用户
+
+实习经历
+ABC科技有限公司 | 后端开发实习生 | 2024.07-2024.09
+参与内部ERP系统开发，负责报表模块的后端接口开发。使用Python + Django编写了10+个RESTful API，优化SQL查询将报表生成时间从30秒降至3秒
+
+获奖
+- 蓝桥杯省赛二等奖（2023）
+- 校级优秀学生奖学金（2022-2023）`
+  jdText.value=`【岗位】后端开发工程师
+【公司】某头部互联网公司
+【职责】1. 负责核心业务系统的后端设计与开发 2. 参与系统架构优化和性能调优 3. 编写技术文档和单元测试
+【要求】1. 计算机相关专业本科及以上 2. 熟悉Python/Java/Go中至少一种 3. 掌握MySQL、Redis等常用中间件 4. 了解微服务架构和分布式系统 5. 具备良好的沟通协作能力`
+  err.value=''
+  // auto-trigger analysis
+  await doAnalyze()
+}
 async function saveResumeVersion(){if(!result.value?.resume_id||!result.value?.resume_version_preview)return;try{await axios.post('/api/resume-versions',{resume_id:result.value.resume_id,jd_id:result.value.jd_id,match_id:result.value.match_id,name:result.value.resume_version_preview.version_name,target_role:result.value.resume_version_preview.version_name,content_json:result.value.resume_version_preview,score_snapshot:result.value.resume_version_preview.score_snapshot});versionMsg.value='已保存';await loadVersions();setTimeout(()=>versionMsg.value='',1600)}catch(e){versionMsg.value='保存失败'}}
 async function doClear(){if(!confirm('确认清空?'))return;try{await axios.delete('/api/all-data');cs.value='✓ 已清空';result.value=null;resumeText.value='';jdText.value=''}catch(e){cs.value='✗ '+e.message}}
-onMounted(async()=>{try{const{data}=await axios.get('/api/resumes');savedResumes.value=data.resumes||[]}catch(e){};await loadVersions()})
+onMounted(async()=>{try{const{data}=await axios.get('/api/resumes');savedResumes.value=data.resumes||[]}catch(e){};await loadHistory();await loadVersions()})
 </script>

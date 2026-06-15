@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import jwt
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -19,16 +20,6 @@ from docx import Document
 
 from database import init_db, get_db, SessionLocal
 from models.db_models import User, Resume, JobDescription, MatchRecord, ResumeVersion
-from models.schemas import (
-    JDDecodeRequest, MatchRequest, OptimizeRequest, TrackRequest,
-    ParseResumeResponse, JDDecodeResponse, MatchResponse,
-    OptimizeResponse, TrackResponse,
-)
-from services.resume_parser import parse_resume_text
-from services.jd_decoder import decode_jd
-from services.matcher import match_candidate
-from services.optimizer import optimize_resume
-from services.analyzer import analyze_once
 from services.extractor import extract
 from services.verifier import verify_extraction
 from services.scorer import score
@@ -150,8 +141,13 @@ def login(req: dict, db: Session = Depends(get_db)):
     username = (req.get("username") or "").strip()
     password = (req.get("password") or "").strip()
     user = db.query(User).filter(User.username == username).first()
-    if not user or not verify_password(password, user.hashed_password):
+    if not user:
+        logger.warning(f"LOGIN FAIL: user '{username}' not found")
         raise HTTPException(401, "用户名或密码错误")
+    if not verify_password(password, user.hashed_password):
+        logger.warning(f"LOGIN FAIL: password mismatch for '{username}' (hash={user.hashed_password[:20]}...)")
+        raise HTTPException(401, "用户名或密码错误")
+    logger.info(f"LOGIN OK: {username}")
     token = create_token(user.user_id, user.username)
     return {"token": token, "user_id": user.user_id, "username": user.username, "is_admin": user.is_admin}
 
@@ -256,271 +252,12 @@ async def extract_text(file: UploadFile = File(...)):
     return {"text": text, "length": len(text), "filename": filename}
 
 
-@app.post("/api/parse-resume", response_model=ParseResumeResponse)
-async def parse_resume(
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """上传简历文件（PDF/Word），返回结构化画像"""
-    # 1. 读取文件内容
-    content = await file.read()
-    filename = file.filename or ""
+@app.post("/api/analyze", response_model=dict)
 
-    # 2. 提取文本
-    text = ""
-    try:
-        if filename.lower().endswith(".pdf"):
-            with io.BytesIO(content) as f:
-                with pdfplumber.open(f) as pdf:
-                    text = "\n".join(
-                        page.extract_text() or "" for page in pdf.pages
-                    )
-        elif filename.lower().endswith((".docx", ".doc")):
-            with io.BytesIO(content) as f:
-                doc = Document(f)
-                text = "\n".join(p.text for p in doc.paragraphs)
-        else:
-            raise HTTPException(400, "仅支持 PDF 和 Word (.docx) 格式")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(422, f"文件解析失败: {str(e)}")
-
-    if not text or len(text.strip()) < 50:
-        raise HTTPException(422, "简历文本内容过少，请检查文件是否有效")
-
-    logger.info(f"Resume text extracted: {len(text)} chars")
-
-    # 3. LLM 解析
-    try:
-        profile = parse_resume_text(text)
-        if not profile:
-            raise HTTPException(500, "LLM 解析返回空结果")
-    except Exception as e:
-        raise HTTPException(500, f"LLM 解析失败: {str(e)}")
-
-    # 4. 落库
-    resume = Resume(
-        user_id=user.user_id,
-        profile_json=profile,
-        file_url=filename,
-    )
-    db.add(resume)
-    db.commit()
-    db.refresh(resume)
-
-    return ParseResumeResponse(
-        resume_id=resume.resume_id,
-        profile_json=profile,
-        parse_status="success",
-    )
-
-
-# === JD 基因解码 ===
-
-@app.post("/api/decode-jd", response_model=JDDecodeResponse)
-async def api_decode_jd(req: JDDecodeRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """输入 JD 文本，返回四层基因解码"""
-    jd_text = req.jd_text.strip()
-    if len(jd_text) < 100:
-        raise HTTPException(400, "JD 文本过短，请提供完整的岗位描述")
-
-    # LLM 解码
-    try:
-        dna = decode_jd(jd_text)
-        if not dna:
-            raise HTTPException(500, "JD 解码返回空结果")
-    except Exception as e:
-        raise HTTPException(500, f"JD 解码失败: {str(e)}")
-
-    # 从 DNA 中提取基本信息
-    job_summary = dna.get("job_summary", {})
-    title = job_summary.get("title", "")
-
-    # 落库
-    jd = JobDescription(
-        user_id=user.user_id,
-        title=title,
-        raw_text=jd_text,
-        dna_json=dna,
-    )
-    db.add(jd)
-    db.commit()
-    db.refresh(jd)
-
-    return JDDecodeResponse(
-        jd_id=jd.jd_id,
-        dna_json=dna,
-        decode_status="success",
-    )
-
-
-# === 能力匹配 ===
-
-@app.post("/api/match", response_model=MatchResponse)
-async def api_match(req: MatchRequest, db: Session = Depends(get_db)):
-    """候选人画像 vs JD基因 → 6维匹配 + 差距分析"""
-    # 从数据库加载
-    resume = db.query(Resume).filter(Resume.resume_id == req.resume_id).first()
-    if not resume:
-        raise HTTPException(404, "简历记录不存在")
-
-    jd = db.query(JobDescription).filter(JobDescription.jd_id == req.jd_id).first()
-    if not jd:
-        raise HTTPException(404, "JD 记录不存在")
-
-    # LLM 匹配
-    try:
-        result = match_candidate(resume.profile_json, jd.dna_json)
-        if not result:
-            raise HTTPException(500, "匹配引擎返回空结果")
-    except Exception as e:
-        raise HTTPException(500, f"匹配失败: {str(e)}")
-
-    # 落库
-    record = MatchRecord(
-        resume_id=resume.resume_id,
-        jd_id=jd.jd_id,
-        match_result_json=result,
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-
-    return MatchResponse(
-        match_id=record.match_id,
-        overall_score=result.get("overall_score", 0),
-        dimensions=result.get("dimensions", {}),
-        gap_analysis=result.get("gap_analysis", []),
-    )
-
-
-# === 简历优化建议 ===
-
-@app.post("/api/optimize-resume", response_model=OptimizeResponse)
-async def api_optimize(req: OptimizeRequest, db: Session = Depends(get_db)):
-    """基于匹配结果，生成简历优化建议"""
-    resume = db.query(Resume).filter(Resume.resume_id == req.resume_id).first()
-    if not resume:
-        raise HTTPException(404, "简历记录不存在")
-
-    jd = db.query(JobDescription).filter(JobDescription.jd_id == req.jd_id).first()
-    if not jd:
-        raise HTTPException(404, "JD 记录不存在")
-
-    # 查找匹配记录
-    match_record = (
-        db.query(MatchRecord)
-        .filter(
-            MatchRecord.resume_id == req.resume_id,
-            MatchRecord.jd_id == req.jd_id,
-        )
-        .order_by(MatchRecord.created_at.desc())
-        .first()
-    )
-    if not match_record:
-        raise HTTPException(400, "请先进行匹配分析")
-
-    # LLM 优化
-    try:
-        result = optimize_resume(
-            resume.profile_json,
-            jd.dna_json,
-            match_record.match_result_json,
-        )
-    except Exception as e:
-        raise HTTPException(500, f"优化建议生成失败: {str(e)}")
-
-    return OptimizeResponse(
-        resume_id=resume.resume_id,
-        jd_id=jd.jd_id,
-        suggestions=result.get("suggestions", []),
-    )
-
-
-# === 投递跟踪 ===
-
-@app.post("/api/track-application", response_model=TrackResponse)
-async def api_track(req: TrackRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """标记投递状态（pending → interview / offer / rejected）"""
-    from models.db_models import Application
-
-    match_record = db.query(MatchRecord).filter(MatchRecord.match_id == req.match_id).first()
-    if not match_record:
-        raise HTTPException(404, "匹配记录不存在")
-
-    app_record = db.query(Application).filter(Application.match_id == req.match_id).first()
-    if app_record:
-        app_record.status = req.status
-        app_record.feedback_text = req.feedback_text
-    else:
-        app_record = Application(
-            match_id=req.match_id,
-            status=req.status,
-            feedback_text=req.feedback_text,
-        )
-        db.add(app_record)
-    db.commit()
-    db.refresh(app_record)
-
-    return TrackResponse(
-        app_id=app_record.app_id,
-        status=app_record.status,
-        insights=application_insights(db, user.user_id),
-    )
-
-
-# === 一站式分析（推荐） ===
-
-@app.post("/api/analyze")
-async def api_analyze(req: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """
-    一次调用完成全部分析：简历原文 + JD原文 → 评分 + 差距 + 优化建议
-    替代原来的四步分离调用，避免多步幻觉累积
-    """
-    resume_text = (req.get("resume_text") or "").strip()
-    jd_text = (req.get("jd_text") or "").strip()
-    filename = (req.get("filename") or "简历").strip()
-
-    if len(resume_text) < 50:
-        raise HTTPException(400, "简历文本过短")
-    if len(jd_text) < 30:
-        raise HTTPException(400, "JD文本过短")
-
-    result = analyze_once(resume_text, jd_text)
-
-    # 落库
-    profile_json = {
-        "resume_text": resume_text,
-        "summary": result.get("competitive_advantage", ""),
-        "parsed_from": "analyze_once",
-    }
-    resume = Resume(user_id=user.user_id, profile_json=profile_json, file_url=filename)
-    db.add(resume)
-    db.flush()
-
-    jd = JobDescription(user_id=user.user_id, raw_text=jd_text, dna_json={})
-    db.add(jd)
-    db.flush()
-
-    match_result = {
-        "overall_score": result.get("overall_score"),
-        "dimensions": result.get("dimensions"),
-        "gap_analysis": result.get("gap_analysis"),
-        "match_verdict": result.get("match_verdict"),
-    }
-    record = MatchRecord(resume_id=resume.resume_id, jd_id=jd.jd_id, match_result_json=match_result)
-    db.add(record)
-    db.commit()
-
-    return {
-        "resume_id": resume.resume_id,
-        "jd_id": jd.jd_id,
-        "match_id": record.match_id,
-        **result,
-    }
-
+@app.post("/api/analyze", response_model=dict)
+async def api_analyze_deprecated():
+    """已废弃，请使用 POST /api/analyze-v2（LLM提取→代码验证→代码评分→LLM文案）"""
+    raise HTTPException(410, "此接口已废弃，请使用 POST /api/analyze-v2")
 
 # === 一站式分析 V2（推荐） ===
 
@@ -566,7 +303,11 @@ async def api_analyze_v2(req: dict, db: Session = Depends(get_db), user: User = 
         "overall_score": results["overall_score"],
         "dimensions": results["dimensions"],
         "gap_analysis": results.get("gap_analysis", []),
+        "suggestions": results.get("suggestions", []),
         "match_verdict": results.get("match_verdict", ""),
+        "killer_sentence": results.get("killer_sentence", ""),
+        "competitive_advantage": results.get("competitive_advantage", ""),
+        "interview_probability": results.get("interview_probability", ""),
         "strategy": results.get("strategy", {}),
         "diagnostics": results.get("diagnostics", {}),
         "resume_version_preview": version_preview,
@@ -582,6 +323,59 @@ async def api_analyze_v2(req: dict, db: Session = Depends(get_db), user: User = 
         "verified": verified,
         "resume_version_preview": version_preview,
         **results,
+    }
+
+
+# === 历史分析记录 ===
+
+@app.get("/api/match-history")
+def match_history(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """获取当前用户的所有历史分析记录"""
+    records = (
+        db.query(MatchRecord, Resume, JobDescription)
+        .join(Resume, MatchRecord.resume_id == Resume.resume_id)
+        .join(JobDescription, MatchRecord.jd_id == JobDescription.jd_id)
+        .filter(Resume.user_id == user.user_id, Resume.deleted_at.is_(None))
+        .order_by(MatchRecord.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return {
+        "history": [{
+            "match_id": m.match_id,
+            "resume_id": m.resume_id,
+            "resume_name": r.file_url or "简历",
+            "jd_title": j.title or "JD",
+            "jd_snippet": (j.raw_text or "")[:80].replace("\n", " "),
+            "overall_score": (m.match_result_json or {}).get("overall_score"),
+            "match_verdict": (m.match_result_json or {}).get("match_verdict", ""),
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        } for m, r, j in records]
+    }
+
+
+@app.get("/api/match/{match_id}")
+def get_match(match_id: str, db: Session = Depends(get_db)):
+    """获取单次匹配的完整记录"""
+    match = db.query(MatchRecord).filter(MatchRecord.match_id == match_id).first()
+    if not match:
+        raise HTTPException(404, "匹配记录不存在")
+    jd = db.query(JobDescription).filter(JobDescription.jd_id == match.jd_id).first()
+    resume = db.query(Resume).filter(Resume.resume_id == match.resume_id).first()
+    return {
+        "match_id": match.match_id,
+        "resume_id": match.resume_id,
+        "resume_text": (resume.profile_json or {}).get("resume_text", "") if resume else "",
+        "jd_id": match.jd_id,
+        "jd_text": jd.raw_text if jd else "",
+        "overall_score": (match.match_result_json or {}).get("overall_score"),
+        "dimensions": (match.match_result_json or {}).get("dimensions"),
+        "gap_analysis": (match.match_result_json or {}).get("gap_analysis", []),
+        "suggestions": (match.match_result_json or {}).get("suggestions", []),
+        "match_verdict": (match.match_result_json or {}).get("match_verdict", ""),
+        "killer_sentence": (match.match_result_json or {}).get("killer_sentence", ""),
+        "strategy": (match.match_result_json or {}).get("strategy"),
+        "created_at": match.created_at.isoformat() if match.created_at else None,
     }
 
 
@@ -753,14 +547,40 @@ def list_resumes(user: User = Depends(get_current_user), db: Session = Depends(g
 
 @app.get("/api/resume/{resume_id}")
 def get_resume(resume_id: str, db: Session = Depends(get_db)):
-    """获取指定简历的完整信息"""
+    """获取指定简历的完整信息 + 最后一次分析结果"""
     resume = db.query(Resume).filter(Resume.resume_id == resume_id).first()
     if not resume:
         raise HTTPException(404, "简历不存在")
+
+    # 查最后一次匹配记录
+    latest_match = (
+        db.query(MatchRecord)
+        .filter(MatchRecord.resume_id == resume_id)
+        .order_by(MatchRecord.created_at.desc())
+        .first()
+    )
+
+    match_data = None
+    if latest_match:
+        jd = db.query(JobDescription).filter(JobDescription.jd_id == latest_match.jd_id).first()
+        match_data = {
+            "match_id": latest_match.match_id,
+            "jd_id": latest_match.jd_id,
+            "jd_text": jd.raw_text if jd else "",
+            "overall_score": latest_match.match_result_json.get("overall_score"),
+            "dimensions": latest_match.match_result_json.get("dimensions"),
+            "match_verdict": latest_match.match_result_json.get("match_verdict"),
+            "killer_sentence": latest_match.match_result_json.get("killer_sentence"),
+            "gap_analysis": latest_match.match_result_json.get("gap_analysis", []),
+            "suggestions": latest_match.match_result_json.get("suggestions", []),
+            "created_at": latest_match.created_at.isoformat() if latest_match.created_at else None,
+        }
+
     return {
         "resume_id": resume.resume_id,
         "resume_text": (resume.profile_json or {}).get("resume_text", ""),
         "profile_json": resume.profile_json,
+        "last_analysis": match_data,
     }
 
 
@@ -810,3 +630,22 @@ def delete_all_data(db: Session = Depends(get_db)):
     db.execute(text("DELETE FROM resumes"))
     db.commit()
     return {"status": "cleared", "note": "所有数据已物理删除，不可恢复"}
+
+
+# === 生产模式：服务前端（SPA 路由支持） ===
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+if os.path.exists(FRONTEND_DIR):
+    from fastapi.responses import FileResponse
+
+    # 挂载静态资源（JS/CSS/图片等）
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """SPA fallback：所有非 API 路径返回 index.html"""
+        if full_path.startswith("api/"):
+            raise HTTPException(404, "API route not found")
+        file_path = os.path.join(FRONTEND_DIR, full_path) if full_path else FRONTEND_DIR
+        if os.path.isfile(file_path) and not full_path.startswith("api/"):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
